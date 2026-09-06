@@ -275,11 +275,20 @@ class Attention(nn.Module, AttentionLayerBase):
         # case anything bypassed that path.
         kv_cache_scheme = getattr(quant_config, "kv_cache_scheme", None)
         if kv_cache_scheme is not None and kv_cache_dtype == "auto":
-            kv_cache_dtype = "fp8"
-            calculate_kv_scales = False
-            if cache_config is not None:
-                cache_config.cache_dtype = "fp8"
-                cache_config.calculate_kv_scales = False
+            # ...and only where a quantized KV cache is actually a win. Below
+            # SM80 there is no FP8 hardware, so honouring a checkpoint's KV
+            # directive costs far more than the weights it ships with; the
+            # same policy gates the resolve path in
+            # vllm.utils.torch_utils.resolve_kv_cache_dtype_string.
+            # (v100-skinny, results/mixed_regression_closed_20260818.md)
+            from vllm.utils.torch_utils import checkpoint_kv_quant_allowed
+
+            if checkpoint_kv_quant_allowed():
+                kv_cache_dtype = "fp8"
+                calculate_kv_scales = False
+                if cache_config is not None:
+                    cache_config.cache_dtype = "fp8"
+                    cache_config.calculate_kv_scales = False
 
         # Check if per-head quant scales are required based on kv_cache_scheme
         use_per_head_quant_scales = (

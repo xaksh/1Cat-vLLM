@@ -334,6 +334,7 @@ if TYPE_CHECKING:
     VLLM_SM70_MOE_ADD_ALLREDUCE: bool = False
     VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR: bool = False
     VLLM_SM70_TP8_HIERARCHICAL_PUSH_AR: bool = False
+    VLLM_SM70_TP4_HIERARCHICAL_CUSTOM_AR: bool = False
     VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH: bool = False
     VLLM_SM70_MOE_SINGLE_TOKEN_PERMUTE_FASTPATH: bool = False
     VLLM_SM70_MOE_SINGLE_TOKEN_UNPERMUTE_FASTPATH: bool = True
@@ -2658,6 +2659,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_TP8_HIERARCHICAL_PUSH_AR": lambda: bool(
         int(os.getenv("VLLM_SM70_TP8_HIERARCHICAL_PUSH_AR", "0"))
+    ),
+    "VLLM_SM70_TP4_HIERARCHICAL_CUSTOM_AR": lambda: bool(
+        int(os.getenv("VLLM_SM70_TP4_HIERARCHICAL_CUSTOM_AR", "0"))
     ),
     # Legacy 0.0.3 SM70 MoE permute/unpermute micro fast paths. They bypass
     # CUB sort and the generic k-way reduction for the n_token==1 decode case.

@@ -1,0 +1,24 @@
+FROM nvidia/cuda:12.8.1-devel-ubuntu24.04
+
+# Throwaway dev image for building 1Cat-vLLM from source (never attempted
+# before this session — production image only ever used the prebuilt wheel).
+# Separate from the production Dockerfile so a from-source build attempt
+# never risks the known-working prod image.
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.12 python3.12-venv python3.12-dev python3-pip curl ca-certificates \
+    build-essential git cmake ninja-build ccache \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3.12 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+ENV CC="ccache gcc"
+ENV CXX="ccache g++"
+
+RUN pip install --no-cache-dir torch==2.10.* --index-url https://download.pytorch.org/whl/cu128
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
+
+WORKDIR /workspace

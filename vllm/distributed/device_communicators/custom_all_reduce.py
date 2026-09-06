@@ -31,6 +31,19 @@ logger = init_logger(__name__)
 
 _SM70_TP8_HIERARCHICAL_ELEMENTS = frozenset((4096, 8 * 4096))
 _SM70_TP8_HIERARCHICAL_SCRATCH_BYTES = 4 * 8 * 4096 * torch.float16.itemsize
+# Two-GPU-clique hierarchical custom allreduce for a 2+2 NVLink-pair TP4
+# topology. Element counts reuse the same Qwen3.8-sized TP4 push-allreduce
+# byte constants defined on the C++ side (csrc/custom_all_reduce.cuh):
+# 4096 (8KiB), 2560 (5KiB, Qwen4Exp).
+#
+# Narrowed from the original 5-size set to only the two sizes measured
+# faster than NCCL (container_build/tp4_hierarchical_correctness_test.py):
+# larger sizes (4*2560, 8*2560, 8*5120) are 0.86x/0.54x/0.60x SLOWER than
+# NCCL, and DFlash2's 80KiB (8*5120) verify payload hit that losing size on
+# every round, causing a net throughput regression. Falling through to NCCL
+# for those sizes instead fixes it.
+_SM70_TP4_HIERARCHICAL_ELEMENTS = frozenset((4096, 2560))
+_SM70_TP4_HIERARCHICAL_SCRATCH_BYTES = 4 * (8 * 5120) * torch.float16.itemsize
 _EXPANDABLE_SEGMENTS_TRUE_PATTERN = re.compile(
     r"((?:^|,)\s*expandable_segments\s*:\s*)True(?=\s*(?:,|$))"
 )
@@ -85,6 +98,15 @@ def _sm70_tp8_hierarchical_peer_ranks(rank: int) -> tuple[int, ...]:
     return (*range(clique_base, clique_base + 4), pair_rank)
 
 
+def _sm70_tp4_hierarchical_peer_ranks(rank: int) -> tuple[int, ...]:
+    """Return the two-rank clique and its direct cross-clique peer."""
+    if not 0 <= rank < 4:
+        raise ValueError(f"SM70 TP4 hierarchical rank must be in [0, 4), got {rank}")
+    clique_base = 0 if rank < 2 else 2
+    pair_rank = rank + 2 if rank < 2 else rank - 2
+    return (*range(clique_base, clique_base + 2), pair_rank)
+
+
 def _can_p2p(rank: int, world_size: int) -> bool:
     for i in range(world_size):
         if i == rank:
@@ -131,6 +153,7 @@ class CustomAllreduce:
         self.long_prefill_output_ptrs: list[int] | None = None
         self.sm70_tp4_push_buffer_ptrs: list[int] | None = None
         self.sm70_tp8_hierarchical_push_buffer_ptrs: list[int] | None = None
+        self.tp4_hierarchical = False
 
         if not custom_ar:
             # disable because of missing custom allreduce library
@@ -212,6 +235,7 @@ class CustomAllreduce:
         assert current_platform.is_cuda_alike()
         fully_connected = current_platform.is_fully_connected(physical_device_ids)
         tp8_hierarchical = False
+        tp4_hierarchical = False
         hierarchical_peer_ranks: tuple[int, ...] | None = None
         if world_size > 2 and not fully_connected:
             sm70_tp8_candidate = (
@@ -221,7 +245,14 @@ class CustomAllreduce:
                 and device_capability.major == 7
                 and device_capability.minor == 0
             )
-            if not sm70_tp8_candidate:
+            sm70_tp4_candidate = (
+                envs.VLLM_SM70_TP4_HIERARCHICAL_CUSTOM_AR
+                and world_size == 4
+                and device_capability is not None
+                and device_capability.major == 7
+                and device_capability.minor == 0
+            )
+            if not (sm70_tp8_candidate or sm70_tp4_candidate):
                 logger.warning(
                     "Custom allreduce is disabled because it's not supported on"
                     " more than two PCIe-only GPUs. To silence this warning, "
@@ -229,14 +260,18 @@ class CustomAllreduce:
                 )
                 return
 
-            hierarchical_peer_ranks = _sm70_tp8_hierarchical_peer_ranks(rank)
+            hierarchical_peer_ranks = (
+                _sm70_tp8_hierarchical_peer_ranks(rank)
+                if sm70_tp8_candidate
+                else _sm70_tp4_hierarchical_peer_ranks(rank)
+            )
             try:
                 rank_device_indices = [
                     device_ids.index(physical_id) for physical_id in physical_device_ids
                 ]
             except ValueError:
                 logger.warning(
-                    "SM70 TP8 hierarchical custom allreduce cannot map all rank "
+                    "SM70 hierarchical custom allreduce cannot map all rank "
                     "devices into CUDA_VISIBLE_DEVICES."
                 )
                 return
@@ -251,17 +286,21 @@ class CustomAllreduce:
             dist.all_gather_object(topology_status, local_topology_ok, group=self.group)
             if not all(status is True for status in topology_status):
                 logger.warning(
-                    "SM70 TP8 hierarchical custom allreduce is disabled because "
+                    "SM70 hierarchical custom allreduce is disabled because "
                     "a required clique or paired NVLink P2P edge is unavailable."
                 )
                 return
-            tp8_hierarchical = True
+            if sm70_tp8_candidate:
+                tp8_hierarchical = True
+            else:
+                tp4_hierarchical = True
         # test P2P capability, this checks software/cudaruntime support
         # this is expensive to compute at the first time
         # then we cache the result
         # On AMD GPU, p2p is always enabled between XGMI connected GPUs
         if (
             not tp8_hierarchical
+            and not tp4_hierarchical
             and not current_platform.is_rocm()
             and not _can_p2p(rank, world_size)
         ):
@@ -279,6 +318,7 @@ class CustomAllreduce:
         meta_scratch_size = max(
             max_size,
             _SM70_TP8_HIERARCHICAL_SCRATCH_BYTES if tp8_hierarchical else 0,
+            _SM70_TP4_HIERARCHICAL_SCRATCH_BYTES if tp4_hierarchical else 0,
         )
         self.meta_ptrs = self.create_shared_buffer(
             ops.meta_size() + meta_scratch_size,
@@ -316,6 +356,7 @@ class CustomAllreduce:
         self.world_size = world_size
         self.fully_connected = fully_connected
         self.tp8_hierarchical = tp8_hierarchical
+        self.tp4_hierarchical = tp4_hierarchical
         self._ptr = ops.init_custom_ar(
             self.meta_ptrs, self.rank_data, rank, self.fully_connected
         )
@@ -429,6 +470,11 @@ class CustomAllreduce:
             return (
                 inp.dtype == torch.float16
                 and inp.numel() in _SM70_TP8_HIERARCHICAL_ELEMENTS
+            )
+        if self.tp4_hierarchical:
+            return (
+                inp.dtype == torch.float16
+                and inp.numel() in _SM70_TP4_HIERARCHICAL_ELEMENTS
             )
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
         # little performance improvement over NCCL.

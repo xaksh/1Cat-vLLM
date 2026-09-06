@@ -55,6 +55,12 @@ constexpr size_t kSm70Tp8HierarchicalAllreduce64KiBBytes =
     8 * 4096 * sizeof(half);
 constexpr int kSm70Tp8HierarchicalPushWorldSize = 8;
 constexpr int kSm70Tp8HierarchicalPushCliqueSize = 4;
+// Two-GPU-clique hierarchical custom allreduce for a 2+2 NVLink-pair TP4
+// topology (e.g. two independent NVLink-bonded GPU pairs bridged only by
+// PCIe, as opposed to a full 4-way NVLink mesh). Mirrors the TP8 hierarchical
+// scheme's clique-then-single-cross-clique-peer structure at half the clique
+// size; see sm70_tp4_hierarchical_reduce / sm70_tp4_clique_barrier below.
+constexpr int kSm70Tp4HierarchicalCliqueSize = 2;
 constexpr int kSm70Tp8HierarchicalPushThreads = 128;
 constexpr int kSm70Tp8HierarchicalPushMaxBlocks = 64;
 constexpr int kSm70Tp8HierarchicalPushEpochs = 2;
@@ -249,6 +255,36 @@ inline bool sm70_tp8_hierarchical_peer(int rank, int peer) {
 inline bool sm70_tp8_hierarchical_allreduce_size(size_t bytes) {
   return bytes == kSm70Tp8HierarchicalAllreduce8KiBBytes ||
          bytes == kSm70Tp8HierarchicalAllreduce64KiBBytes;
+}
+
+inline bool sm70_tp4_hierarchical_custom_ar_enabled(int world_size,
+                                                    bool fully_connected) {
+  const char* raw = std::getenv("VLLM_SM70_TP4_HIERARCHICAL_CUSTOM_AR");
+  return raw != nullptr && std::atoi(raw) != 0 && world_size == 4 &&
+         !fully_connected && custom_allreduce_current_device_is_sm70();
+}
+
+inline bool sm70_tp4_hierarchical_peer(int rank, int peer) {
+  return rank / kSm70Tp4HierarchicalCliqueSize ==
+             peer / kSm70Tp4HierarchicalCliqueSize ||
+         rank + kSm70Tp4HierarchicalCliqueSize == peer ||
+         peer + kSm70Tp4HierarchicalCliqueSize == rank;
+}
+
+// Reuses the existing Qwen3.8-sized TP4 push-allreduce byte constants
+// (defined below) rather than inventing new generic sizes: this hierarchical
+// path targets the same real decode/verifier payload shapes.
+//
+// Narrowed to only the two sizes measured faster than NCCL
+// (container_build/tp4_hierarchical_correctness_test.py microbenchmark):
+// 2560/4096-element messages are 1.28-1.38x faster, but 10240/20480/40960
+// are 0.86x/0.54x/0.60x SLOWER (cross-clique polling handshake doesn't scale
+// to larger, bandwidth-bound messages). DFlash2's 40960-element verify
+// payload hit the losing size on every round, causing a net regression;
+// letting it fall through to NCCL instead fixes that.
+inline bool sm70_tp4_hierarchical_allreduce_size(size_t bytes) {
+  return bytes == kSm70Tp4PushAllreduce8KiBBytes ||
+         bytes == kSm70Tp4PushAllreduceQwen4ExpBytes;
 }
 
 inline int sm70_tp8_hierarchical_push_blocks(size_t bytes) {
@@ -1533,6 +1569,91 @@ static __global__ void __launch_bounds__(512, 1)
   if (tid == 0) self_sg->_flag[0] = pair_flag;
 }
 
+// Two-GPU-clique mirror of sm70_tp8_clique_barrier/sm70_tp8_hierarchical_reduce
+// above, for a TP4 topology built from two independent NVLink-bonded pairs
+// (e.g. GPU0<->GPU1 and GPU2<->GPU3) bridged only by PCIe. The reduction
+// structure is identical to the TP8 case -- reduce within a clique, exchange
+// exactly one FP32 partial with the single directly-paired cross-clique rank,
+// sum the two partials -- just at half the clique size. Reuses the same
+// Signal/RankData scratch layout and slot constants as the TP8 path; this is
+// safe because a given process only ever runs one of TP8-hierarchical or
+// TP4-hierarchical for a given CustomAllreduce group (world_size is fixed per
+// deployment), so the slot ranges are never concurrently active for both.
+DINLINE FlagType sm70_tp4_clique_barrier(const RankSignals& sg, Signal* self_sg,
+                                         int rank, int signal_slot) {
+  const int tid = threadIdx.x;
+  const int clique_base = rank < 2 ? 0 : 2;
+  const FlagType flag = self_sg->_flag[0] + 1;
+  if (tid < 2) {
+    const int peer = clique_base + tid;
+    st_flag_sys_visible(&sg.signals[peer]->start[signal_slot][rank], flag);
+    while (ld_flag_sys_visible(&self_sg->start[signal_slot][peer]) != flag);
+  }
+  __syncthreads();
+  if (tid == 0) self_sg->_flag[0] = flag;
+  return flag;
+}
+
+static __global__ void __launch_bounds__(512, 1)
+    sm70_tp4_hierarchical_reduce(RankData* _dp, RankSignals sg, Signal* self_sg,
+                                 half* __restrict__ result, int rank,
+                                 int packed_size) {
+  using P = typename packed_t<half>::P;
+  using A = typename packed_t<half>::A;
+
+  const int tid = threadIdx.x;
+  const int clique_base = rank < 2 ? 0 : 2;
+  const int pair_rank = rank < 2 ? rank + 2 : rank - 2;
+  auto dp = *_dp;
+
+  // The counter advances twice per call. Alternate signal/data slots so one
+  // clique may safely run one round ahead of its paired clique.
+  const int partial_slot = (self_sg->_flag[0] >> 1) & 1;
+  const FlagType clique_flag =
+      sm70_tp4_clique_barrier(sg, self_sg, rank, partial_slot);
+  A* const self_partial = get_tmp_buf<A>(self_sg) + partial_slot * packed_size;
+  const A* const pair_partial =
+      get_tmp_buf<A>(sg.signals[pair_rank]) + partial_slot * packed_size;
+
+  for (int idx = tid; idx < packed_size; idx += blockDim.x) {
+    A partial{};
+    partial = upcast(reinterpret_cast<const P*>(dp.ptrs[clique_base])[idx]);
+#pragma unroll
+    for (int i = 1; i < 2; ++i) {
+      packed_assign_add(
+          partial,
+          upcast(reinterpret_cast<const P*>(dp.ptrs[clique_base + i])[idx]));
+    }
+    self_partial[idx] = partial;
+  }
+
+  // Publish the FP32 clique partial only after every producer thread has made
+  // its store visible to the paired GPU.
+  __threadfence_system();
+  __syncthreads();
+  const FlagType pair_flag = clique_flag + 1;
+  if (tid < 2) {
+    const int peer = clique_base + tid;
+    const int completion_slot = kSm70Tp8CompletionSignalSlotBase + partial_slot;
+    st_flag_volatile(&sg.signals[peer]->end[completion_slot][rank], pair_flag);
+    while (ld_flag_volatile(&self_sg->end[completion_slot][peer]) != pair_flag);
+  } else if (tid == 2) {
+    st_flag_release(&sg.signals[pair_rank]->end[partial_slot][rank], pair_flag);
+    while (ld_flag_acquire(&self_sg->end[partial_slot][pair_rank]) !=
+           pair_flag);
+  }
+  __syncthreads();
+
+  for (int idx = tid; idx < packed_size; idx += blockDim.x) {
+    // Both cliques form the same (ranks 0..1) + (ranks 2..3) FP32 tree,
+    // independent of which side writes the output.
+    A total = rank < 2 ? self_partial[idx] : pair_partial[idx];
+    packed_assign_add(total, rank < 2 ? pair_partial[idx] : self_partial[idx]);
+    reinterpret_cast<P*>(result)[idx] = downcast<P>(total);
+  }
+  if (tid == 0) self_sg->_flag[0] = pair_flag;
+}
+
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1)
     cross_device_reduce_2stage(RankData* _dp, RankSignals sg, Signal* self_sg,
@@ -1877,6 +1998,12 @@ class CustomAllreduce {
             rd.ptrs[j] = nullptr;
             continue;
           }
+          if (sm70_tp4_hierarchical_custom_ar_enabled(world_size_,
+                                                      fully_connected_) &&
+              !sm70_tp4_hierarchical_peer(rank_, j)) {
+            rd.ptrs[j] = nullptr;
+            continue;
+          }
           char* handle =
               open_ipc_handle(&handles[j][i * sizeof(cudaIpcMemHandle_t)]);
           handle += offsets[j][i];
@@ -1952,6 +2079,13 @@ class CustomAllreduce {
                   sm70_tp4_push_buffers_, input, output, rank_, size);
           return;
         }
+      }
+      if (sm70_tp4_hierarchical_custom_ar_enabled(world_size_,
+                                                  fully_connected_) &&
+          sm70_tp4_hierarchical_allreduce_size(bytes)) {
+        sm70_tp4_hierarchical_reduce<<<1, 512, 0, stream>>>(
+            ptrs, sg_, self_sg_, output, rank_, size);
+        return;
       }
       if (sm70_tp8_hierarchical_push_buffers_registered_ &&
           status == cudaStreamCaptureStatusActive &&
