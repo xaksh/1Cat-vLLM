@@ -594,3 +594,50 @@ PTQ at the same bit width) and production readiness, not raw speed. **Not
 adopted as a production change today — logged as a real, promising option to
 revisit** if quality-validated and hardened (tool-calling support, broader
 quality eval beyond one coding prompt, sustained-load testing) later.
+
+## 10. Rebase onto latest upstream main + real-world test of `VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY`
+
+Rebased `tp4-hierarchical-allreduce-sm70` onto `origin/main` (81 new commits,
+mostly an unrelated video-generation model integration — "H3"/MiniMax/ComfyUI
+work, not relevant here). Clean rebase, no conflicts. Rebuilt via the CMake
+incremental workflow (fresh `cmake --preset release` + `cmake --build
+--preset release --target install`, ~183s configure + full build, inside
+`1cat-vllm-devbuild`). **Re-validated our own allreduce fix's correctness
+after the rebuild** via `container_build/tp4_hierarchical_correctness_test.py`
+(launched with `torchrun --nproc_per_node=4`, not directly — needs `RANK` set
+per-process): **ALL CHECKS PASSED** — 0.000000 max abs/rel diff over 100 seeds
+at both message sizes, bf16 correctly bypasses, 2000-iteration stress test
+clean (no hang/corruption), 1.33x speedup at both sizes vs NCCL (consistent
+with, slightly below the 1.42x/1.41x measured after the first rebase — within
+noise).
+
+### 10a. Testing the new opt-in DFlash2 concurrency flag against real serving
+
+Upstream's Sept 3 doc (`docs/design/sm70_quasar_nvfp4_dflash2_acceptance.md`)
+reported `VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY=1` giving 5.18-5.50x
+speedup for batched grouped verification at 16,384-token context (B2-B8,
+CUDA-graph-median kernel microbenchmarks on their 32GB V100s) — but explicitly
+flagged it as unvalidated end-to-end ("before either opt-in becomes default,
+run a matched TP4 endpoint matrix with the fully QUASAR checkpoint").
+
+Tested exactly that: TP4, our allreduce fix, DFlash2 (q7/num_speculative_tokens=8),
+2 concurrent requests, ~19K-token prompts (matching their promising context
+range), 400-token completions each (temp=0.7):
+
+| Config | Aggregate tok/s |
+|---|---:|
+| Flag off (default) | **51.1** |
+| Flag on | **25.7** |
+
+**The flag roughly halved real end-to-end throughput** — the opposite of the
+kernel-level claim. Confirms the upstream doc's own caution was warranted:
+an isolated kernel-level speedup did not translate to a real serving win here,
+likely due to some interaction with scheduling overhead or our own kernel
+stack (custom allreduce fix, TileLang GDN paths) not present in their isolated
+microbenchmark. **Not adopted — flag left at its default (off).**
+
+The TP2-specific WIP branch (`codex/v100-quasar-dflash2-tp2-baseline`,
+unmerged, 3 commits ahead of main, adding a new TP2 E4M3 scalar decode path
+for DFlash2) was noted but not tested — unmerged/unreviewed, and TP2+DFlash2
+is already known infeasible here on pure weight-memory grounds regardless of
+kernel improvements (§ elsewhere this session).
