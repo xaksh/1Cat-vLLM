@@ -494,3 +494,103 @@ level (exact numerical match) and the end-to-end output level (coherent,
 non-corrupted generations), and every measured configuration — target-only,
 single-stream DFlash2, and concurrent DFlash2 — now exceeds its original
 pre-this-session baseline.
+
+## 9. llama.cpp + Unsloth Q4_K_XL + MTP exploration (separate thread from the allreduce work above)
+
+Not part of the vLLM/allreduce fix — a parallel investigation into whether
+llama.cpp + Unsloth's Q4 GGUF + native MTP speculative decoding beats our
+production vLLM setup. Kept in this log since it's the same overall
+decision space (what to actually run in production).
+
+### 9a. Model refresh
+Local `Qwen3.8-27B-UD-Q4_K_XL.gguf` (downloaded Aug 16, 17.92 GB) was stale —
+Unsloth shipped "Dynamic v3.0" ~20 days ago (10% higher accuracy claimed at
+the same size, post-training quant, not QAT). Re-downloaded from
+`unsloth/Qwen3.8-27B-GGUF` (same filename, new content): **16.35 GiB**,
+confirmed via GGUF header scan to still carry MTP weights
+(`blk.64.nextn.{eh_proj,enorm,hnorm,shared_head_norm}.weight`,
+`qwen35.nextn_predict_layers` metadata key) — self-speculative, no separate
+draft checkpoint needed, matching the same design as the NVFP4 QUASAR
+checkpoint's baked-in MTP head (§ elsewhere this session). Old file replaced
+in place at `/home/aksh/models/gguf/Qwen3.8-27B-UD-Q4_K_XL.gguf`.
+
+llama.cpp's own flag for this: `--spec-type draft-mtp` (native support,
+confirmed via `llama-server --help`).
+
+### 9b. TP2 (one island, GPU0+1) — memory-constrained, real crash found
+
+Weight footprint: ~9.5 GB/GPU (matches this project's older historical
+measurement for this quant class). At **full 262,144 context**, MTP enabled:
+booted with only **530 MiB free/GPU** (15,854/16,384 MiB used) — survived one
+short exchange (~65 cached tokens) but **crashed under a real stress test**:
+a plain 20,000-filler-word prompt (~26K real tokens) hit a genuine CUDA OOM
+mid-matmul during MTP draft processing:
+```
+ggml_cuda_pool_vmm::alloc() -> ggml_cuda_mul_mat_cublas ->
+common_speculative_impl_draft_mtp::process()
+```
+**Conclusion: TP2 + MTP + full context is not safe on this hardware.**
+At **half context (131,072)**, TP2 was solid (~12.65 GB/GPU, comfortable
+margin). Benchmarked there (quicksort prompt, 400 tokens):
+
+| Config | Sampling | tok/s (server) | Draft accept |
+|---|---|---:|---|
+| No MTP | temp=0 | 45.9 | — |
+| MTP (n-max=3) | temp=0 (greedy) | 71.8 | 63.7% (167/262) |
+| No MTP | Unsloth thinking (temp=1.0, top_p=0.95, top_k=20) | 48.3 | — |
+| MTP (n-max=3) | Unsloth thinking | 61.4 | 48.4% (236/488) |
+
+Greedy overstates the real speedup (~1.5x) vs. the model's actual intended
+sampling regime (~1.27x) — acceptance rate drops meaningfully at real
+temperature since it's no longer an exact-match criterion.
+
+### 9c. TP4 (all 4 GPUs) — much safer, and faster
+
+Weight footprint: ~8.94 GB/GPU (vs. TP2's ~9.5, plus 3 more GPUs sharing the
+same total) — **7.4+ GiB free/GPU** at boot. Ran the same context-fill stress
+sweep that crashed TP2 (20K/60K/120K filler words): **survived cleanly,
+memory barely moved** (9216 -> 9226 MiB/GPU across a 6x growth in real prompt
+tokens, 22K -> 133K). tok/s degrades with context length as expected
+(58.0 -> 49.0 -> 40.5 tok/s over that same sweep) — normal attention-cost
+scaling, not a memory problem.
+
+Full 262,144 context, Unsloth thinking-mode sampling, quicksort prompt:
+
+| Config | tok/s (server) |
+|---|---:|
+| No MTP | 56.5 |
+| MTP (n-max=3) | 77.1 |
+
+**This is the best number of the whole exploration** — beats every TP2
+result, at full context, with real memory safety margin (unlike TP2's
+razor-thin/crashing full-context case).
+
+### 9d. `--spec-draft-n-max` sweep (TP4, Unsloth thinking-mode sampling, 300-token completions)
+
+| n-max | tok/s | Draft accept |
+|---|---:|---|
+| 1 | 59.8 | 73.8% |
+| 2 | 62.6 | 59.3% |
+| **3** | **69.3** | **68.6%** |
+| 4 | 51.8 | 38.8% |
+| 5 | 56.9 | 44.0% |
+| 7 | 56.2 | 43.2% |
+
+**n-max=3 is the genuine peak**, not an arbitrary default — acceptance rate
+falls off a cliff past 3 (69% -> ~39-44%), so drafting further ahead is mostly
+wasted compute on this checkpoint/hardware. All §9b/9c numbers above already
+used n-max=3.
+
+### 9e. vs. current production (vLLM TP4, our hierarchical allreduce fix, NVFP4 QUASAR-QAT, no MTP)
+
+| | tok/s | Quantization | Hardening |
+|---|---:|---|---|
+| Production (vLLM) | 74.5 | NVFP4, **QAT** (QUASAR — GPQA-Diamond 0.9091 vs BF16 teacher's 0.9141) | Tool calling, vision, systemd service, memory-safety validated all session |
+| llama.cpp TP4+MTP(n-max=3) | 69.3-77.1 | Q4_K_XL, **PTQ** (Unsloth Dynamic v3) | Single quick test only — no tool-calling/API validation, only partial stress-testing |
+
+Roughly a throughput tie (within single-sample noise); the real
+differentiator is quantization method (QAT should preserve more quality than
+PTQ at the same bit width) and production readiness, not raw speed. **Not
+adopted as a production change today — logged as a real, promising option to
+revisit** if quality-validated and hardened (tool-calling support, broader
+quality eval beyond one coding prompt, sustained-load testing) later.
