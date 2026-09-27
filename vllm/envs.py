@@ -335,6 +335,9 @@ if TYPE_CHECKING:
     VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR: bool = False
     VLLM_SM70_TP8_HIERARCHICAL_PUSH_AR: bool = False
     VLLM_SM70_TP4_HIERARCHICAL_CUSTOM_AR: bool = False
+    VLLM_SM70_TP4_HIERARCHICAL_PUSH_AR: bool = False
+    VLLM_SM70_TP4_HIERARCHICAL_PUSH_MAX_BYTES: int = 81920
+    VLLM_SM70_TP4_HIERARCHICAL_PUSH_BLOCKS: int = 40
     VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH: bool = False
     VLLM_SM70_MOE_SINGLE_TOKEN_PERMUTE_FASTPATH: bool = False
     VLLM_SM70_MOE_SINGLE_TOKEN_UNPERMUTE_FASTPATH: bool = True
@@ -2662,6 +2665,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_TP4_HIERARCHICAL_CUSTOM_AR": lambda: bool(
         int(os.getenv("VLLM_SM70_TP4_HIERARCHICAL_CUSTOM_AR", "0"))
+    ),
+    # Push (write-only across PCIe), multi-block variant of the 2+2 TP4
+    # hierarchical all-reduce, used for FP16 messages inside CUDA graphs.
+    # Requires VLLM_SM70_TP4_HIERARCHICAL_CUSTOM_AR=1. Off by default.
+    "VLLM_SM70_TP4_HIERARCHICAL_PUSH_AR": lambda: bool(
+        int(os.getenv("VLLM_SM70_TP4_HIERARCHICAL_PUSH_AR", "0"))
+    ),
+    # Largest FP16 message (bytes) routed to the TP4 push kernel; larger ones
+    # keep their previous path. Capped by the kernel's 160 KiB capacity.
+    # Default 80 KiB covers an 8-row x 5120 speculative-verify payload.
+    "VLLM_SM70_TP4_HIERARCHICAL_PUSH_MAX_BYTES": lambda: int(
+        os.getenv("VLLM_SM70_TP4_HIERARCHICAL_PUSH_MAX_BYTES", "81920")
+    ),
+    # Fixed grid size of the TP4 push kernel, read once by the C++ side.
+    # Must be identical on all ranks. Range [1, 64].
+    "VLLM_SM70_TP4_HIERARCHICAL_PUSH_BLOCKS": lambda: int(
+        os.getenv("VLLM_SM70_TP4_HIERARCHICAL_PUSH_BLOCKS", "40")
     ),
     # Legacy 0.0.3 SM70 MoE permute/unpermute micro fast paths. They bypass
     # CUB sort and the generic k-way reduction for the n_token==1 decode case.

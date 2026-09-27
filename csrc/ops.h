@@ -773,10 +773,14 @@ void dispose(fptr_t _fa);
 int64_t meta_size();
 int64_t sm70_tp4_push_allreduce_buffer_size();
 int64_t sm70_tp8_hierarchical_push_allreduce_buffer_size();
+int64_t sm70_tp4_hierarchical_push_allreduce_buffer_size();
+int64_t sm70_tp4_hierarchical_push_allreduce_max_bytes();
 void register_buffer(fptr_t _fa, const std::vector<int64_t>& fake_ipc_ptrs);
 void register_sm70_tp4_push_allreduce_buffer(
     fptr_t _fa, const std::vector<int64_t>& fake_ipc_ptrs);
 void register_sm70_tp8_hierarchical_push_allreduce_buffer(
+    fptr_t _fa, const std::vector<int64_t>& fake_ipc_ptrs);
+void register_sm70_tp4_hierarchical_push_allreduce_buffer(
     fptr_t _fa, const std::vector<int64_t>& fake_ipc_ptrs);
 std::tuple<std::vector<int64_t>, std::vector<int64_t>>
 get_graph_buffer_ipc_meta(fptr_t _fa);

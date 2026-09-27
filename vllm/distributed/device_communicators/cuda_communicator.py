@@ -22,9 +22,9 @@ from .base_device_communicator import DeviceCommunicatorBase
 
 logger = init_logger(__name__)
 _SM70_TP4_LONG_PREFILL_BUFFER_BYTES = 8192 * 5120 * 2
-_SEEN_TP_ALLREDUCE_PATHS: set[tuple[str, str, tuple[int, ...], torch.dtype, int]] = (
-    set()
-)
+_SEEN_TP_ALLREDUCE_PATHS: set[
+    tuple[str, str, tuple[int, ...], torch.dtype, int, bool]
+] = set()
 
 
 def _trace_all_reduce_path(
@@ -34,24 +34,27 @@ def _trace_all_reduce_path(
 ) -> None:
     if not envs.VLLM_TP_ALLREDUCE_TRACE:
         return
+    graph_capture = torch.cuda.is_current_stream_capturing()
     key = (
         communicator.unique_name,
         backend,
         tuple(input_.shape),
         input_.dtype,
         input_.element_size() * input_.numel(),
+        graph_capture,
     )
     if key in _SEEN_TP_ALLREDUCE_PATHS:
         return
     _SEEN_TP_ALLREDUCE_PATHS.add(key)
     logger.warning(
         "TP all-reduce trace backend=%s group=%s shape=%s dtype=%s bytes=%d "
-        "custom_enabled=%s torch_symm_mem=%s flashinfer=%s",
+        "graph_capture=%s custom_enabled=%s torch_symm_mem=%s flashinfer=%s",
         backend,
         communicator.unique_name,
         tuple(input_.shape),
         input_.dtype,
         input_.element_size() * input_.numel(),
+        graph_capture,
         communicator.use_custom_allreduce,
         communicator.use_torch_symm_mem,
         communicator.use_flashinfer_allreduce,
@@ -371,7 +374,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ):
             out = ca_comm.custom_all_reduce(input_)
             assert out is not None
-            _trace_all_reduce_path(self, "custom", input_)
+            if envs.VLLM_TP_ALLREDUCE_TRACE:
+                _trace_all_reduce_path(
+                    self, f"custom:{ca_comm.route_name(input_)}", input_
+                )
             return out
         symm_mem_comm = self.symm_mem_comm
         if symm_mem_comm is not None and symm_mem_comm.should_use_symm_mem(input_):

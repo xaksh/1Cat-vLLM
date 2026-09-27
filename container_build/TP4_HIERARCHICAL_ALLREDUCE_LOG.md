@@ -641,3 +641,57 @@ unmerged, 3 commits ahead of main, adding a new TP2 E4M3 scalar decode path
 for DFlash2) was noted but not tested — unmerged/unreviewed, and TP2+DFlash2
 is already known infeasible here on pure weight-memory grounds regardless of
 kernel improvements (§ elsewhere this session).
+
+## 11. Push variant + in-graph test harness (2026-09-27, not yet run on hardware)
+
+### Why
+Decode sits at ~150-180 W per GPU (of 300 W) at 74.5 tok/s, i.e. the GPUs are
+waiting, not streaming weights. Rough budget per token (13.4 ms): ~5 ms of
+weight streaming (3.8 GB/GPU at ~750-800 GB/s), and ~128 all-reduces at
+35-47 us each = 4.5-6 ms. The pull kernel also:
+- reads the cross-pair partial over PCIe (non-posted reads, one round trip
+  each), from a single 512-thread block;
+- loses to NCCL from 10 KiB up, so every speculative-verify message and every
+  prefill message goes to NCCL.
+
+Open question this also answers: the model's hidden size is 5120
+(`kSm70GemmaRmsNormHiddenSize`), so a 1-token decode all-reduce should be
+5120 elements, which the pull whitelist (2560, 4096) does NOT accept. Run once
+with `VLLM_TP_ALLREDUCE_TRACE=1`; the trace now prints `graph_capture=` and a
+`custom:tp4_hierarchical_push|pull` sub-route, so it shows exactly which
+sizes each path gets.
+
+### What
+`sm70_tp4_hierarchical_reduce_push` (csrc/custom_all_reduce.cuh), a 2-clique
+port of the existing `sm70_tp8_hierarchical_reduce_push`:
+- FP16 input pushed to both clique members (NVLink), FP32 clique partial
+  pushed to the cross peer (PCIe). Only posted writes cross PCIe.
+- Data is its own ready flag (reserved NaN sentinel), no flag handshake.
+- Multi-block, FIXED grid (default 40 x 128 threads,
+  `VLLM_SM70_TP4_HIERARCHICAL_PUSH_BLOCKS`), two epochs per block. The grid
+  must not vary with message size: see the comment on
+  `sm70_tp4_hierarchical_push_blocks` for the slot-reuse argument.
+- Same reduction tree as the pull kernel, (r0+r1)+(r2+r3) in FP32, so results
+  are bit-identical to it.
+- CUDA-graph capture only (same rule as every other push path here); eager and
+  warmup calls keep the pull whitelist, then NCCL.
+
+Enable: `VLLM_SM70_TP4_HIERARCHICAL_CUSTOM_AR=1 VLLM_SM70_TP4_HIERARCHICAL_PUSH_AR=1`.
+Size gate: any FP16 message <= `VLLM_SM70_TP4_HIERARCHICAL_PUSH_MAX_BYTES`
+(default 81920 = 8 x 5120 x 2, kernel capacity 163840).
+
+Also: `custom_all_reduce_sum2` now returns None on the 2+2 topology (falls back
+to `all_reduce(a + b)`). No hierarchical sum2 kernel exists, and the generic
+sum2 kernels would dereference the unmapped non-peer rank. Only MoE layers
+use sum2.
+
+### Test plan
+1. `container_build/tp4_hierarchical_push_test.py` (torchrun, 4 ranks), run
+   with PUSH_AR=1 and PUSH_AR=0. Rank-distinct inputs, bit-exact vs the
+   reduction tree, a mixed-size graph replayed 2000x (hang / slot-reuse
+   stress), and an in-graph microbenchmark for custom and NCCL.
+2. Sweep `VLLM_SM70_TP4_HIERARCHICAL_PUSH_BLOCKS` in {8, 16, 24, 40, 64}.
+3. Set `VLLM_SM70_TP4_HIERARCHICAL_PUSH_MAX_BYTES` to the largest size that
+   still beats NCCL in step 1.
+4. Full engine: target-only + DFlash2, same prompts as 8d, with
+   `VLLM_TP_ALLREDUCE_TRACE=1` on the first boot.

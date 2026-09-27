@@ -154,6 +154,8 @@ class CustomAllreduce:
         self.sm70_tp4_push_buffer_ptrs: list[int] | None = None
         self.sm70_tp8_hierarchical_push_buffer_ptrs: list[int] | None = None
         self.tp4_hierarchical = False
+        self.sm70_tp4_hierarchical_push_buffer_ptrs: list[int] | None = None
+        self.tp4_hierarchical_push_max_bytes = 0
 
         if not custom_ar:
             # disable because of missing custom allreduce library
@@ -419,6 +421,27 @@ class CustomAllreduce:
                 "SM70 TP8 hierarchical push all-reduce enabled for exact "
                 "FP16 8-KiB and 64-KiB CUDA-Graph payloads."
             )
+        if tp4_hierarchical and envs.VLLM_SM70_TP4_HIERARCHICAL_PUSH_AR:
+            assert hierarchical_peer_ranks is not None
+            push_buffer_size = ops.sm70_tp4_hierarchical_push_allreduce_buffer_size()
+            self.sm70_tp4_hierarchical_push_buffer_ptrs = self.create_shared_buffer(
+                push_buffer_size,
+                group=group,
+                peer_ranks=set(hierarchical_peer_ranks),
+            )
+            ops.register_sm70_tp4_hierarchical_push_allreduce_buffer(
+                self._ptr, self.sm70_tp4_hierarchical_push_buffer_ptrs
+            )
+            self.tp4_hierarchical_push_max_bytes = min(
+                envs.VLLM_SM70_TP4_HIERARCHICAL_PUSH_MAX_BYTES,
+                ops.sm70_tp4_hierarchical_push_allreduce_max_bytes(),
+            )
+            logger.info(
+                "SM70 TP4 hierarchical push all-reduce enabled for FP16 "
+                "CUDA-Graph payloads up to %d bytes (%d blocks).",
+                self.tp4_hierarchical_push_max_bytes,
+                envs.VLLM_SM70_TP4_HIERARCHICAL_PUSH_BLOCKS,
+            )
 
     @contextmanager
     def capture(self):
@@ -455,6 +478,31 @@ class CustomAllreduce:
         offsets = cast(list[list[int]], [d[1] for d in all_data])
         ops.register_graph_buffers(self._ptr, handles, offsets)
 
+    def _tp4_push_eligible(self, inp: torch.Tensor) -> bool:
+        # Push runs only inside CUDA-graph capture (the C++ dispatch enforces
+        # the same). Eager/warmup calls must not be widened past the pull
+        # kernel's whitelist, because the generic kernels cannot reach the
+        # non-peer rank on this topology.
+        if self.sm70_tp4_hierarchical_push_buffer_ptrs is None:
+            return False
+        nbytes = inp.numel() * inp.element_size()
+        return (
+            inp.dtype == torch.float16
+            and 0 < nbytes <= self.tp4_hierarchical_push_max_bytes
+            and nbytes % 16 == 0
+            and torch.cuda.is_current_stream_capturing()
+        )
+
+    def route_name(self, inp: torch.Tensor) -> str:
+        """Which custom kernel family a call will use (for path tracing)."""
+        if self.tp4_hierarchical:
+            if self._tp4_push_eligible(inp):
+                return "tp4_hierarchical_push"
+            return "tp4_hierarchical_pull"
+        if self.tp8_hierarchical:
+            return "tp8_hierarchical"
+        return "flat"
+
     def should_custom_ar(self, inp: torch.Tensor):
         if self.disabled:
             return False
@@ -472,6 +520,8 @@ class CustomAllreduce:
                 and inp.numel() in _SM70_TP8_HIERARCHICAL_ELEMENTS
             )
         if self.tp4_hierarchical:
+            if self._tp4_push_eligible(inp):
+                return True
             return (
                 inp.dtype == torch.float16
                 and inp.numel() in _SM70_TP4_HIERARCHICAL_ELEMENTS
@@ -981,6 +1031,10 @@ class CustomAllreduce:
     ) -> torch.Tensor | None:
         if self.disabled or not self.should_custom_ar(input_a):
             return None
+        # No 2+2 hierarchical sum2 kernel exists; the generic sum2 kernels
+        # would dereference the unmapped non-peer rank on this topology.
+        if self.tp4_hierarchical:
+            return None
         if input_a.shape != input_b.shape or input_a.dtype != input_b.dtype:
             return None
         if not is_weak_contiguous(input_b):
@@ -1013,6 +1067,12 @@ class CustomAllreduce:
                     rank=self.rank,
                 )
                 self.sm70_tp8_hierarchical_push_buffer_ptrs = None
+            if self.sm70_tp4_hierarchical_push_buffer_ptrs is not None:
+                self.free_shared_buffer(
+                    self.sm70_tp4_hierarchical_push_buffer_ptrs,
+                    rank=self.rank,
+                )
+                self.sm70_tp4_hierarchical_push_buffer_ptrs = None
 
     def __del__(self):
         self.close()

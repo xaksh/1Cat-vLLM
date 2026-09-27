@@ -61,6 +61,32 @@ constexpr int kSm70Tp8HierarchicalPushCliqueSize = 4;
 // scheme's clique-then-single-cross-clique-peer structure at half the clique
 // size; see sm70_tp4_hierarchical_reduce / sm70_tp4_clique_barrier below.
 constexpr int kSm70Tp4HierarchicalCliqueSize = 2;
+// Push (write-only) variant of the 2+2 hierarchical all-reduce. Every lane
+// pushes its FP16 input into both clique members' receive slots over NVLink,
+// forms the ordered FP32 clique partial locally, then pushes that partial into
+// the cross-clique peer's receive slot over PCIe. Nothing is ever *read*
+// across PCIe: posted writes pipeline through the switch, non-posted reads
+// each pay a full round trip. The data itself doubles as the ready flag
+// (reserved NaN sentinel), so there is no separate flag handshake.
+//
+// Capacity covers up to 16 decode/verify rows of a 5120-wide hidden state.
+constexpr size_t kSm70Tp4HierarchicalPushCapacityBytes = 16 * 5120 * 2;
+constexpr int kSm70Tp4HierarchicalPushThreads = 128;
+constexpr int kSm70Tp4HierarchicalPushMaxBlocks = 64;
+constexpr int kSm70Tp4HierarchicalPushDefaultBlocks = 40;
+constexpr int kSm70Tp4HierarchicalPushEpochs = 2;
+constexpr size_t kSm70Tp4HierarchicalPushSignalBytes =
+    ((kSm70Tp4HierarchicalPushMaxBlocks * sizeof(uint32_t) + 127) / 128) * 128;
+// FP16 inputs from both clique members, per epoch.
+constexpr size_t kSm70Tp4HierarchicalPushCliqueBytes =
+    kSm70Tp4HierarchicalPushEpochs * kSm70Tp4HierarchicalCliqueSize *
+    kSm70Tp4HierarchicalPushCapacityBytes;
+// One FP32 partial (2x the FP16 byte count) from the cross-clique peer.
+constexpr size_t kSm70Tp4HierarchicalPushCrossBytes =
+    kSm70Tp4HierarchicalPushEpochs * 2 * kSm70Tp4HierarchicalPushCapacityBytes;
+constexpr size_t kSm70Tp4HierarchicalPushBufferBytes =
+    kSm70Tp4HierarchicalPushSignalBytes + kSm70Tp4HierarchicalPushCliqueBytes +
+    kSm70Tp4HierarchicalPushCrossBytes;
 constexpr int kSm70Tp8HierarchicalPushThreads = 128;
 constexpr int kSm70Tp8HierarchicalPushMaxBlocks = 64;
 constexpr int kSm70Tp8HierarchicalPushEpochs = 2;
@@ -285,6 +311,36 @@ inline bool sm70_tp4_hierarchical_peer(int rank, int peer) {
 inline bool sm70_tp4_hierarchical_allreduce_size(size_t bytes) {
   return bytes == kSm70Tp4PushAllreduce8KiBBytes ||
          bytes == kSm70Tp4PushAllreduceQwen4ExpBytes;
+}
+
+inline bool sm70_tp4_hierarchical_push_size(size_t bytes) {
+  return bytes > 0 && bytes % 16 == 0 &&
+         bytes <= kSm70Tp4HierarchicalPushCapacityBytes;
+}
+
+// The grid is deliberately FIXED for every message size. Each block keeps its
+// own epoch counter and a packed lane is always owned by the same block, so a
+// slot (epoch, lane) is never reused by the next call. A size-dependent grid
+// would move lanes between blocks whose epochs can coincide, letting a fast
+// peer overwrite a slot before its owner has consumed it.
+inline int sm70_tp4_hierarchical_push_blocks() {
+  static const int blocks = [] {
+    const char* raw = std::getenv("VLLM_SM70_TP4_HIERARCHICAL_PUSH_BLOCKS");
+    if (raw == nullptr || raw[0] == '\0') {
+      return kSm70Tp4HierarchicalPushDefaultBlocks;
+    }
+    char* end = nullptr;
+    const long parsed = std::strtol(raw, &end, 10);
+    if (end == raw || *end != '\0' || parsed < 1 ||
+        parsed > kSm70Tp4HierarchicalPushMaxBlocks) {
+      throw std::runtime_error(
+          "Invalid VLLM_SM70_TP4_HIERARCHICAL_PUSH_BLOCKS: " +
+          std::string(raw) + ". Expected an integer in [1, " +
+          std::to_string(kSm70Tp4HierarchicalPushMaxBlocks) + "].");
+    }
+    return static_cast<int>(parsed);
+  }();
+  return blocks;
 }
 
 inline int sm70_tp8_hierarchical_push_blocks(size_t bytes) {
@@ -1654,6 +1710,176 @@ static __global__ void __launch_bounds__(512, 1)
   if (tid == 0) self_sg->_flag[0] = pair_flag;
 }
 
+// Push variant of sm70_tp4_hierarchical_reduce for the same 2+2 topology.
+// Produces a bit-identical result: the tree is (r0 + r1) + (r2 + r3) in FP32,
+// with each clique partial summed in rank order, then one downcast.
+//
+// Per packed lane (8 halves):
+//   1. push FP16 input into slot[source_slot] of both clique members (NVLink)
+//   2. spin on the local clique slots until neither holds the sentinel
+//   3. FP32 partial = slot[0] + slot[1]; push it (2 x 16B) to the cross peer
+//      (PCIe, posted writes only)
+//   4. spin on the local cross slot, add partials in fixed order, write out
+//   5. reset the consumed local slots to the sentinel
+//
+// Slot reuse safety: two epochs per block, fixed grid (see
+// sm70_tp4_hierarchical_push_blocks). A rank can only start call n+2 after it
+// consumed call n+1 data from every rank it pushes to, and those ranks only
+// produce call n+1 data after their call n kernel (including the slot resets)
+// has retired on their stream.
+static __global__ void __launch_bounds__(kSm70Tp4HierarchicalPushThreads, 1)
+    sm70_tp4_hierarchical_reduce_push(RankData push_buffers,
+                                      const half* __restrict__ input,
+                                      half* __restrict__ output, int rank,
+                                      int packed_size) {
+  using P = typename packed_t<half>::P;
+  using A = typename packed_t<half>::A;
+  using F = array_t<float, 4>;
+  static_assert(sizeof(A) == 2 * sizeof(F));
+
+  constexpr int packed_stride =
+      kSm70Tp4HierarchicalPushCapacityBytes / sizeof(P);
+  constexpr uint32_t fp32_sentinel = 0x7f7f7f7f;
+  const int clique_base = rank < 2 ? 0 : 2;
+  const int source_slot = rank - clique_base;
+  const int pair_rank = rank < 2 ? rank + 2 : rank - 2;
+  auto* local_storage =
+      const_cast<char*>(reinterpret_cast<const char*>(push_buffers.ptrs[rank]));
+  auto* local_epochs = reinterpret_cast<uint32_t*>(local_storage);
+  const uint32_t epoch = local_epochs[blockIdx.x];
+  const int clique_epoch_offset =
+      epoch * kSm70Tp4HierarchicalCliqueSize * packed_stride;
+  const int cross_epoch_offset = epoch * 2 * packed_stride;
+  char* const local_clique =
+      local_storage + kSm70Tp4HierarchicalPushSignalBytes;
+  char* const local_cross = local_clique + kSm70Tp4HierarchicalPushCliqueBytes;
+  auto* pair_storage = const_cast<char*>(
+      reinterpret_cast<const char*>(push_buffers.ptrs[pair_rank]));
+  void* const pair_cross = pair_storage + kSm70Tp4HierarchicalPushSignalBytes +
+                           kSm70Tp4HierarchicalPushCliqueBytes;
+
+  for (int offset = blockIdx.x * blockDim.x + threadIdx.x; offset < packed_size;
+       offset += gridDim.x * blockDim.x) {
+    P value = reinterpret_cast<const P*>(input)[offset];
+#pragma unroll
+    for (int element = 0; element < P::size; ++element) {
+      sm70_push_escape_sentinel(value.data[element]);
+    }
+
+#pragma unroll
+    for (int destination_slot = 0;
+         destination_slot < kSm70Tp4HierarchicalCliqueSize;
+         ++destination_slot) {
+      auto* destination_storage =
+          const_cast<char*>(reinterpret_cast<const char*>(
+              push_buffers.ptrs[clique_base + destination_slot]));
+      void* destination =
+          destination_storage + kSm70Tp4HierarchicalPushSignalBytes +
+          (clique_epoch_offset + source_slot * packed_stride) * sizeof(P);
+      sm70_push_store_volatile_16b(value, destination, offset);
+    }
+
+    P peer_values[kSm70Tp4HierarchicalCliqueSize];
+    while (true) {
+      bool has_empty_slot = false;
+#pragma unroll
+      for (int peer_slot = 0; peer_slot < kSm70Tp4HierarchicalCliqueSize;
+           ++peer_slot) {
+        const void* source =
+            local_clique +
+            (clique_epoch_offset + peer_slot * packed_stride) * sizeof(P);
+        sm70_push_load_volatile_16b(peer_values[peer_slot], source, offset);
+#pragma unroll
+        for (int element = 0; element < P::size; ++element) {
+          has_empty_slot |=
+              sm70_push_is_sentinel(peer_values[peer_slot].data[element]);
+        }
+      }
+      if (!has_empty_slot) break;
+    }
+
+    A partial = upcast(peer_values[0]);
+#pragma unroll
+    for (int peer_slot = 1; peer_slot < kSm70Tp4HierarchicalCliqueSize;
+         ++peer_slot) {
+      packed_assign_add(partial, upcast(peer_values[peer_slot]));
+    }
+    // A finite FP16 sum can never produce this FP32 bit pattern, but keep the
+    // reserved value unrepresentable on the wire regardless.
+#pragma unroll
+    for (int element = 0; element < A::size; ++element) {
+      auto* bits = reinterpret_cast<uint32_t*>(&partial.data[element]);
+      if (*bits == fp32_sentinel) *bits = 0x7fc00000;
+    }
+
+    const auto* partial_words = reinterpret_cast<const F*>(&partial);
+    sm70_push_store_volatile_16b(partial_words[0], pair_cross,
+                                 cross_epoch_offset + 2 * offset);
+    sm70_push_store_volatile_16b(partial_words[1], pair_cross,
+                                 cross_epoch_offset + 2 * offset + 1);
+
+    F pair_words[2];
+    while (true) {
+      bool has_empty_slot = false;
+      sm70_push_load_volatile_16b(pair_words[0], local_cross,
+                                  cross_epoch_offset + 2 * offset);
+      sm70_push_load_volatile_16b(pair_words[1], local_cross,
+                                  cross_epoch_offset + 2 * offset + 1);
+#pragma unroll
+      for (int word = 0; word < 2; ++word) {
+#pragma unroll
+        for (int element = 0; element < F::size; ++element) {
+          has_empty_slot |= *reinterpret_cast<const uint32_t*>(
+                                &pair_words[word].data[element]) ==
+                            fp32_sentinel;
+        }
+      }
+      if (!has_empty_slot) break;
+    }
+
+    A pair_partial;
+#pragma unroll
+    for (int element = 0; element < F::size; ++element) {
+      pair_partial.data[element] = pair_words[0].data[element];
+      pair_partial.data[element + F::size] = pair_words[1].data[element];
+    }
+    // Same (ranks 0..1) + (ranks 2..3) order on both cliques.
+    A total = rank < 2 ? partial : pair_partial;
+    packed_assign_add(total, rank < 2 ? pair_partial : partial);
+    reinterpret_cast<P*>(output)[offset] = downcast<P>(total);
+
+    P empty_input;
+#pragma unroll
+    for (int element = 0; element < P::size; ++element) {
+      *reinterpret_cast<uint16_t*>(&empty_input.data[element]) =
+          kSm70Tp4PushAllreduceSentinel;
+    }
+#pragma unroll
+    for (int peer_slot = 0; peer_slot < kSm70Tp4HierarchicalCliqueSize;
+         ++peer_slot) {
+      void* source =
+          local_clique +
+          (clique_epoch_offset + peer_slot * packed_stride) * sizeof(P);
+      sm70_push_store_volatile_16b(empty_input, source, offset);
+    }
+
+    F empty_cross;
+#pragma unroll
+    for (int element = 0; element < F::size; ++element) {
+      *reinterpret_cast<uint32_t*>(&empty_cross.data[element]) = fp32_sentinel;
+    }
+    sm70_push_store_volatile_16b(empty_cross, local_cross,
+                                 cross_epoch_offset + 2 * offset);
+    sm70_push_store_volatile_16b(empty_cross, local_cross,
+                                 cross_epoch_offset + 2 * offset + 1);
+  }
+
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    local_epochs[blockIdx.x] = (epoch + 1) % kSm70Tp4HierarchicalPushEpochs;
+  }
+}
+
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1)
     cross_device_reduce_2stage(RankData* _dp, RankSignals sg, Signal* self_sg,
@@ -1815,6 +2041,8 @@ class CustomAllreduce {
   bool sm70_tp4_push_buffers_registered_ = false;
   RankData sm70_tp8_hierarchical_push_buffers_{};
   bool sm70_tp8_hierarchical_push_buffers_registered_ = false;
+  RankData sm70_tp4_hierarchical_push_buffers_{};
+  bool sm70_tp4_hierarchical_push_buffers_registered_ = false;
 
   /**
    * Signals are an array of ipc-enabled buffers from all ranks.
@@ -1953,6 +2181,30 @@ class CustomAllreduce {
     sm70_tp8_hierarchical_push_buffers_registered_ = true;
   }
 
+  void register_sm70_tp4_hierarchical_push_buffer(void** ptrs) {
+    if (!sm70_tp4_hierarchical_custom_ar_enabled(world_size_,
+                                                 fully_connected_)) {
+      throw std::runtime_error(
+          "SM70 TP4 hierarchical push all-reduce requires "
+          "VLLM_SM70_TP4_HIERARCHICAL_CUSTOM_AR=1 on non-fully-connected "
+          "TP4 SM70.");
+    }
+    for (int peer = 0; peer < world_size_; ++peer) {
+      if (sm70_tp4_hierarchical_peer(rank_, peer) && ptrs[peer] == nullptr) {
+        throw std::runtime_error(
+            "SM70 TP4 hierarchical push all-reduce received a null required "
+            "peer buffer.");
+      }
+      sm70_tp4_hierarchical_push_buffers_.ptrs[peer] = ptrs[peer];
+    }
+    auto* local_data =
+        static_cast<char*>(ptrs[rank_]) + kSm70Tp4HierarchicalPushSignalBytes;
+    CUDACHECK(cudaMemset(local_data, kSm70Tp4PushAllreduceSentinelByte,
+                         kSm70Tp4HierarchicalPushBufferBytes -
+                             kSm70Tp4HierarchicalPushSignalBytes));
+    sm70_tp4_hierarchical_push_buffers_registered_ = true;
+  }
+
   RankData* rank_data_for_buffer(cudaStream_t stream, void* buffer,
                                  const char* op_name) {
     RankData* ptrs;
@@ -2079,6 +2331,19 @@ class CustomAllreduce {
                   sm70_tp4_push_buffers_, input, output, rank_, size);
           return;
         }
+      }
+      // Push only inside CUDA-graph capture, mirroring the other push paths:
+      // eager and warmup calls stay on the registered-buffer pull kernel.
+      if (sm70_tp4_hierarchical_push_buffers_registered_ &&
+          status == cudaStreamCaptureStatusActive &&
+          sm70_tp4_hierarchical_custom_ar_enabled(world_size_,
+                                                  fully_connected_) &&
+          sm70_tp4_hierarchical_push_size(bytes)) {
+        sm70_tp4_hierarchical_reduce_push<<<
+            sm70_tp4_hierarchical_push_blocks(),
+            kSm70Tp4HierarchicalPushThreads, 0, stream>>>(
+            sm70_tp4_hierarchical_push_buffers_, input, output, rank_, size);
+        return;
       }
       if (sm70_tp4_hierarchical_custom_ar_enabled(world_size_,
                                                   fully_connected_) &&

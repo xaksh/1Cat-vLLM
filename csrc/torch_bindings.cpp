@@ -1075,12 +1075,18 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
                 &sm70_tp4_push_allreduce_buffer_size);
   custom_ar.def("sm70_tp8_hierarchical_push_allreduce_buffer_size",
                 &sm70_tp8_hierarchical_push_allreduce_buffer_size);
+  custom_ar.def("sm70_tp4_hierarchical_push_allreduce_buffer_size",
+                &sm70_tp4_hierarchical_push_allreduce_buffer_size);
+  custom_ar.def("sm70_tp4_hierarchical_push_allreduce_max_bytes",
+                &sm70_tp4_hierarchical_push_allreduce_max_bytes);
 
   custom_ar.def("register_buffer", &register_buffer);
   custom_ar.def("register_sm70_tp4_push_allreduce_buffer",
                 &register_sm70_tp4_push_allreduce_buffer);
   custom_ar.def("register_sm70_tp8_hierarchical_push_allreduce_buffer",
                 &register_sm70_tp8_hierarchical_push_allreduce_buffer);
+  custom_ar.def("register_sm70_tp4_hierarchical_push_allreduce_buffer",
+                &register_sm70_tp4_hierarchical_push_allreduce_buffer);
   custom_ar.def("get_graph_buffer_ipc_meta", &get_graph_buffer_ipc_meta);
   custom_ar.def("register_graph_buffers", &register_graph_buffers);
 

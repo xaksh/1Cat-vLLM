@@ -3235,6 +3235,16 @@ def sm70_tp8_hierarchical_push_allreduce_buffer_size() -> int:
     )
 
 
+def sm70_tp4_hierarchical_push_allreduce_buffer_size() -> int:
+    return (
+        _custom_ar_owner_namespace().sm70_tp4_hierarchical_push_allreduce_buffer_size()
+    )
+
+
+def sm70_tp4_hierarchical_push_allreduce_max_bytes() -> int:
+    return _custom_ar_owner_namespace().sm70_tp4_hierarchical_push_allreduce_max_bytes()
+
+
 def register_buffer(fa: int, ipc_tensors: list[int]) -> None:
     return _custom_ar_op("register_buffer")(fa, ipc_tensors)
 
@@ -3247,6 +3257,14 @@ def register_sm70_tp8_hierarchical_push_allreduce_buffer(
     fa: int, ipc_tensors: list[int]
 ) -> None:
     _custom_ar_owner_namespace().register_sm70_tp8_hierarchical_push_allreduce_buffer(
+        fa, ipc_tensors
+    )
+
+
+def register_sm70_tp4_hierarchical_push_allreduce_buffer(
+    fa: int, ipc_tensors: list[int]
+) -> None:
+    _custom_ar_owner_namespace().register_sm70_tp4_hierarchical_push_allreduce_buffer(
         fa, ipc_tensors
     )
 
